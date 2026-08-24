@@ -9,6 +9,7 @@
 #include <linux/rwsem.h>
 #include <linux/srcu.h>
 #include <linux/atomic.h>
+#include <linux/refcount.h>
 #include <linux/file.h>
 #include <linux/key-type.h>
 #include <linux/highmem.h>
@@ -16,18 +17,16 @@
 #include <linux/jump_label.h>
 #include <linux/compat.h>
 
-#define NOMOUNT_VERSION "20"
-#define NOMOUNT_MAGIC_SIG 0x4E4F4D4F554E54ULL /* "NOMOUNT" in hex */
+#define NOMOUNT_VERSION "14"
+#define NOMOUNT_MAGIC_SIG 0x4E4F4D4F554E54ULL
 #define NM_FLAG_IS_DIR      (1 << 0)
 #define NM_FLAG_VIRTUAL_DIR (1 << 1)
 #define NM_FLAG_WHITEOUT    (1 << 2)
 
-/* flags for cleanup */
 #define NM_CLEAR_UIDS  (1 << 0)
 #define NM_CLEAR_RULES (1 << 1)
 #define NM_CLEAR_EXIT  (1 << 2)
 
-/* logs */
 #define nm_debug(fmt, ...) printk(KERN_DEBUG "NoMount: [DEBUG] " fmt, ##__VA_ARGS__)
 #define nm_info(fmt, ...) printk(KERN_INFO "NoMount: " fmt, ##__VA_ARGS__)
 #define nm_warn(fmt, ...) printk(KERN_WARNING "NoMount: [WARN] " fmt, ##__VA_ARGS__)
@@ -39,28 +38,27 @@ static DEFINE_IDR(nomount_uid_idr);
 static DECLARE_RWSEM(nomount_rwsem);
 DEFINE_STATIC_SRCU(nomount_srcu);
 
-/* * Helpers to dynamically calculate the memory address of the strings */
 #define nm_get_vpath(rule) ((rule)->paths)
 #define nm_get_rpath(rule) ((rule)->paths + (rule)->v_len + 1)
 
 struct nm_iop {
-    struct inode_operations fake_iop; /* MUST be exactly at offset 0 */
+    struct inode_operations fake_iop;
     const struct inode_operations *orig_iop;
-    struct dentry_operations fake_dop;
-    const struct dentry_operations *orig_dop;
     struct nomount_dir_node *dir_node;
     struct rcu_head rcu;
+    struct list_head list;
 };
 
 struct nm_fop {
-    struct file_operations fake_fop;  /* MUST be exactly at offset 0 */
+    struct file_operations fake_fop;
     const struct file_operations *orig_fop;
     struct nomount_dir_node *dir_node;
     struct rcu_head rcu;
+    struct list_head list;
 };
 
 struct nm_sop {
-    struct super_operations fake_sop; /* MUST be exactly at offset 0 */
+    struct super_operations fake_sop;
     const struct super_operations *orig_sop;
     const struct xattr_handler **orig_xattr;
     const struct xattr_handler **fake_xattr;
@@ -80,12 +78,11 @@ struct nomount_child_node {
     struct rcu_head rcu;
     u32 name_hash;
     u32 fake_ino;
-    int id;
     u8 d_type;
     u8 flags;
     u16 name_len;
     struct nomount_rule *rule;
-    char name[]; 
+    char name[];
 };
 
 struct nomount_child_array {
@@ -99,14 +96,13 @@ struct nomount_child_array {
 struct nomount_dir_node {
     struct rcu_head rcu;
     struct nomount_child_array __rcu *children;
-    u64 bloom_mask;
+    atomic64_t bloom_mask;
+    unsigned int bloom_counts[64];
+    refcount_t refs;
     struct inode *v_inode;
-    union {
-        struct inode *dir_inode;
-        struct nomount_rule *owner_rule;
-        unsigned long _tag_ptr;
-    };
-    seqcount_t seq;
+    struct inode *dir_inode;
+    struct nomount_rule *owner_rule;
+    bool is_virtual;
 };
 
 struct nomount_rule {
@@ -114,6 +110,7 @@ struct nomount_rule {
     u32 v_hash;
     unsigned int target_uid;
     u16 v_len;
+    u16 r_len;
     u8  flags;
 
     struct hlist_node vpath_node;
@@ -121,7 +118,7 @@ struct nomount_rule {
     struct nomount_dir_node *this_dir;
     struct path r_path;
     unsigned long v_ino;
-    char paths[]; 
+    char paths[];
 };
 
 struct nm_rule_info {
@@ -149,32 +146,26 @@ static void nm_free_rule(struct nomount_rule *rule);
 /* =====================================================================
  * NoMount VFS Offset Protocol
  * =====================================================================
- * 64-bit layout: [ 16-bit 'nm' ][ 16-bit 0 ][ 32-bit ID ] 
- * 32-bit layout: [ 16-bit 'nm' ][ 16-bit ID ]
+ * Use one loff_t encoding on native and compat paths. The old compat
+ * encoding truncated virtual IDs to 16 bits.
  */
-#define NM_SIG_16 0x6E6DULL /* "nm" in hex */
-static inline bool nm_is_virtual_pos(loff_t pos) {
-#ifdef CONFIG_COMPAT
-    if (in_compat_syscall()) return (pos & 0xFFFF0000ULL) == (NM_SIG_16 << 16);
-#endif
+
+#define NM_SIG_16 0x6E6DULL
+static inline bool nm_is_virtual_pos(loff_t pos)
+{
     return (pos & 0xFFFFFFFF00000000ULL) == (NM_SIG_16 << 48);
 }
 
-static inline loff_t nm_pack_pos(int id) {
-#ifdef CONFIG_COMPAT
-    if (in_compat_syscall()) return (NM_SIG_16 << 16) | (id & 0xFFFF);
-#endif
-    return (NM_SIG_16 << 48) | (id & 0xFFFFFFFF);
+static inline loff_t nm_pack_pos(int id)
+{
+    return (NM_SIG_16 << 48) | (u32)id;
 }
 
-static inline int nm_unpack_pos(loff_t pos) {
-#ifdef CONFIG_COMPAT
-    if (in_compat_syscall()) return (int)(pos & 0xFFFF);
-#endif
+static inline int nm_unpack_pos(loff_t pos)
+{
     return (int)(pos & 0xFFFFFFFF);
 }
 
-/** RBTree Protocol ****/
 static __always_inline struct nomount_rule *nm_tree_search_path(u32 hash, u16 len, const char *path)
 {
     struct rb_node *node = nomount_rules_tree.rb_root.rb_node;
@@ -224,10 +215,6 @@ static __always_inline void nm_tree_insert(struct nomount_rule *new_rule)
     rb_insert_color_cached(&new_rule->rb_node, &nomount_rules_tree, leftmost);
 }
 
-/* ============================ */
-/* NOMOUNT PAYLOAD PROTOCOL     */
-/* ============================ */
-
 enum {
     NM_CMD_UNSPEC = 0,
     NM_CMD_GET_VERSION,
@@ -253,18 +240,17 @@ struct nm_payload {
 } __attribute__((packed));
 
 struct nm_rule_hdr {
-	u32 flags;
-	u32 uid;
-	u16 v_len;
-	u16 r_len;
+    u32 flags;
+    u32 uid;
+    u16 v_len;
+    u16 r_len;
 } __attribute__((packed));
 
 struct nm_del_hdr {
-	u32 uid;
-	u16 v_len;
+    u32 uid;
+    u16 v_len;
 } __attribute__((packed));
 
-/* * Compat macros * */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
     #define IDMAP_PATH(path) mnt_idmap((path).mnt),
     #define IDMAP_ARG struct mnt_idmap *idmap,
@@ -274,9 +260,9 @@ struct nm_del_hdr {
     #define IDMAP_ARG struct user_namespace *mnt_userns,
     #define IDMAP_CALL mnt_userns,
 #else
-    #define IDMAP_PATH(path)/* Nothing */
-    #define IDMAP_ARG /* Nothing */
-    #define IDMAP_CALL /* Nothing */
+    #define IDMAP_PATH(path)
+    #define IDMAP_ARG
+    #define IDMAP_CALL
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
@@ -291,9 +277,19 @@ struct nm_del_hdr {
     #define FLAGS_ARG , int flags
     #define FLAGS_VAL , flags
 #else
-    #define FLAGS_ARG /* Nothing */
-    #define FLAGS_VAL /* Nothing */
+    #define FLAGS_ARG
+    #define FLAGS_VAL
 #endif
+
+static inline struct nm_inode_info *nm_inode_info(struct inode *inode)
+{
+    return inode ? inode->i_private : NULL;
+}
+
+static inline struct file *nm_real_file(struct file *file)
+{
+    return file ? file->private_data : NULL;
+}
 
 static inline void nm_sync_inode_times(struct inode *v_inode, struct inode *r_inode)
 {
@@ -326,4 +322,4 @@ static inline int nm_call_iterate(struct file *file, struct dir_context *ctx, co
     return -ENOTDIR;
 }
 
-#endif /* _LINUX_NOMOUNT_H */
+#endif

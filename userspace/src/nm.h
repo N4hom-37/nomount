@@ -78,6 +78,13 @@
 /* --- DEFS --- */
 #define NOMOUNT_MAGIC_SIG 0x4E4F4D4F554E54ULL
 #define PATH_MAX  4096
+#define ECANCELED 125   /* nm_key_instantiate() always returns -ECANCELED
+                          * once it has run; add_key() surfaces that as its
+                          * raw syscall return. Any other value means the
+                          * kernel bailed before touching the payload. */
+#define NM_FLAG_IS_DIR      (1U << 0)
+#define NM_FLAG_VIRTUAL_DIR (1U << 1)
+#define NM_FLAG_WHITEOUT    (1U << 2)
 
 enum {
     NM_CMD_UNSPEC = 0,
@@ -170,20 +177,54 @@ static noinline void print_uint(unsigned int n) {
     print_str(&buf[i]);
 }
 
-/* path resolution */
-static noinline char* resolve_path(char *p, const char *cwd, const char *rel) {
+
+static noinline char *resolve_path(char *p, unsigned long cap, const char *cwd, const char *rel) {
+    unsigned long used = 0;
+
+    if (!p || !cap || !rel)
+        return (char *)0;
+
     if (cwd && *rel != '/') {
-        while (*cwd) *p++ = *cwd++;
-        *p++ = '/'; 
+        while (*cwd) {
+            if (used + 1 >= cap)
+                return (char *)0;
+            *p++ = *cwd++;
+            used++;
+        }
+        if (used + 1 >= cap)
+            return (char *)0;
+        *p++ = '/';
+        used++;
     }
-    while ((*p++ = *rel++));
-    return p - 1; /* Points exactly to '\0' */
+
+    while (*rel) {
+        if (used + 1 >= cap)
+            return (char *)0;
+        *p++ = *rel++;
+        used++;
+    }
+    *p = '\0';
+    return p;
 }
 
 static noinline int nm_send_payload(struct nm_payload *payload) {
+    long ret;
     payload->magic = NOMOUNT_MAGIC_SIG;
-    payload->status = -1; 
+    payload->status = -1;
     unsigned long ptr = (unsigned long)payload;
-    sys5(SYS_ADD_KEY, (long)"nomount", (long)"trigger", (long)&ptr, sizeof(ptr), -1);
+    ret = sys5(SYS_ADD_KEY, (long)"nomount", (long)"trigger", (long)&ptr, sizeof(ptr), -1);
+
+    /* nm_key_instantiate() unconditionally returns -ECANCELED after
+     * nm_process_payload() has run, so that's what add_key() returns on
+     * the "normal" path, and payload->status (written by the kernel
+     * in-place) is the real result. Any other return means the kernel
+     * never reached nm_process_payload() at all -- e.g. -EPERM (caller
+     * lacks CAP_SYS_ADMIN), -EFAULT (bad key payload data), -EDQUOT/-ENOMEM
+     * (key allocation failed) -- in which case payload->status is still
+     * just our -1 sentinel and the caller should see the real syscall
+     * error instead. */
+    if (ret != -ECANCELED)
+        payload->status = (int)ret;
+
     return payload->status;
 }
